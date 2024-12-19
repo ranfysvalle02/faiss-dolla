@@ -4,7 +4,6 @@ import faiss
 import numpy as np
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
-from sentence_transformers import SentenceTransformer
 from langchain_ollama import OllamaEmbeddings
 
 ############################################################
@@ -43,7 +42,6 @@ class CustomMongoAggregator:
     def aggregate(self, pipeline):
         current_collection = self.collection
         temp_collections = []
-
         try:
             pipeline_iter = iter(pipeline)
             sub_pipeline = []
@@ -51,46 +49,35 @@ class CustomMongoAggregator:
                 if not self.contains_custom_operator(stage):
                     sub_pipeline.append(stage)
                 else:
-                    # Execute pipeline without custom operators
                     if sub_pipeline:
                         current_collection = self.execute_sub_pipeline(current_collection, sub_pipeline)
                         sub_pipeline = []
                         temp_collections.append(current_collection)
-
-                    # Process custom stage
                     documents = list(current_collection.find())
                     documents = self.process_custom_stage(documents, stage)
-
-                    # Output to a temp collection
                     temp_collection_name = f"{self.temp_prefix}_{uuid.uuid4().hex}"
                     temp_collection = self.db[temp_collection_name]
                     if documents:
                         temp_collection.insert_many(documents)
                     current_collection = temp_collection
                     temp_collections.append(current_collection)
-
-            # Execute remaining sub_pipeline if any
             if sub_pipeline:
                 current_collection = self.execute_sub_pipeline(current_collection, sub_pipeline)
                 temp_collections.append(current_collection)
-
             results = list(current_collection.find())
-
         except PyMongoError as e:
             self.logger.error(f"MongoDB Error: {e}")
             raise
         except Exception as e:
-            self.logger.error(f"Unexpected Error: {e}")
+            self.logger.exception("Unexpected Error:")
             raise
         finally:
-            # Clean up temporary collections
             for temp_col in temp_collections:
                 if temp_col != self.collection:
                     try:
                         temp_col.drop()
                     except Exception as e:
                         self.logger.warning(f"Failed to drop temp collection {temp_col.name}: {e}")
-
         return results
 
     def execute_sub_pipeline(self, collection, pipeline):
@@ -139,7 +126,6 @@ class CustomMongoAggregator:
             return expr
 
     def evaluate_operator(self, operator, value, doc):
-        # No standard operators implemented
         raise NotImplementedError(f"Operator {operator} not implemented.")
 
     def get_field_value(self, doc, field_path):
@@ -152,26 +138,46 @@ class CustomMongoAggregator:
                 return None
         return value
 
-
 ############################################################
 # FAISS Vector Search
 ############################################################
 class VectorSearchIndex:
-    def __init__(self, docs, embedding_field):
+    def __init__(self, docs, embedding_fields):
         self.logger = logging.getLogger(__name__)
         self.docs = docs
-        self.embedding_field = embedding_field
-        # Using OllamaEmbeddings from langchain_ollama just as an example
+        self.embedding_fields = embedding_fields if isinstance(embedding_fields, list) else [embedding_fields]
         self.model = OllamaEmbeddings(model="nomic-embed-text")
         self.logger.info("Building FAISS index...")
         self.doc_embeddings = self.build_embeddings()
+        if len(self.doc_embeddings) == 0:
+            raise ValueError("No embeddings were generated. Check your fields and data.")
         self.index = self.build_index(self.doc_embeddings)
 
     def build_embeddings(self):
-        texts = [doc.get(self.embedding_field, "") for doc in self.docs]
-        embeddings = self.model.embed_documents(texts)
-        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-        return embeddings
+        aggregated_embeddings = []
+        for doc in self.docs:
+            field_texts = []
+            for field in self.embedding_fields:
+                field_value = doc.get(field, "")
+                if isinstance(field_value, list):
+                    field_texts.extend([str(item) for item in field_value if isinstance(item, str)])
+                elif isinstance(field_value, str):
+                    field_texts.append(field_value)
+            if not field_texts:
+                continue
+            try:
+                embeddings = self.model.embed_documents(field_texts)
+                embeddings = np.array(embeddings)
+                if embeddings.ndim != 2:
+                    continue
+                avg_embedding = np.mean(embeddings, axis=0)
+                norm_embedding = avg_embedding / np.linalg.norm(avg_embedding)
+                aggregated_embeddings.append(norm_embedding)
+            except:
+                continue
+        if not aggregated_embeddings:
+            return np.array([])
+        return np.vstack(aggregated_embeddings).astype('float32')
 
     def build_index(self, embeddings):
         dim = embeddings.shape[1]
@@ -179,87 +185,85 @@ class VectorSearchIndex:
         index.add(embeddings)
         return index
 
-    def search(self, query_text, top_k=5):
-        query_embedding = self.model.embed_documents([query_text])
-        query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
-        distances, indices = self.index.search(query_embedding, top_k)
-        results = []
-        for idx, dist in zip(indices[0], distances[0]):
-            if idx < len(self.docs):
-                results.append((self.docs[idx], float(dist)))
-        return results
+    def search(self, query_texts, top_k=5):
+        if not query_texts:
+            return []
+        try:
+            query_embeddings = self.model.embed_documents(query_texts)
+            query_embeddings = np.array(query_embeddings).astype('float32')
+            if query_embeddings.ndim == 1:
+                query_embeddings = query_embeddings.reshape(1, -1)
+            faiss.normalize_L2(query_embeddings)
+            distances, indices = self.index.search(query_embeddings, top_k)
+            results = []
+            for idx, dist in zip(indices, distances):
+                for i, d in zip(idx, dist):
+                    if i < len(self.docs):
+                        results.append((self.docs[i], float(d)))
+            return results
+        except:
+            return []
 
 def faiss_search_operator(doc, args, index):
-    """
-    $faissSearch operator.
-    Args: [field_name, top_k, min_score (optional)]
-    - field_name: The field from the current doc to use as the query.
-    - top_k: How many results to return.
-    - min_score: Minimum similarity score to consider.
-    """
-    logger = logging.getLogger(__name__)
-
     if len(args) < 2:
-        raise ValueError("$faissSearch requires at least field_name and top_k")
-
+        raise ValueError("$faissSearch requires field_name and top_k")
     field_name = args[0]
     top_k = int(args[1])
     min_score = float(args[2]) if len(args) > 2 else 0.0
-
     field_value = doc.get(field_name)
     if field_value is None:
         return []
-
-    search_results = index.search(field_value, top_k=top_k)
+    if isinstance(field_value, list):
+        query_texts = [str(item) for item in field_value if isinstance(item, str)]
+        if not query_texts:
+            return []
+        search_results = index.search(query_texts, top_k=top_k)
+    elif isinstance(field_value, str):
+        search_results = index.search([field_value], top_k=top_k)
+    else:
+        return []
     filtered = [(d, s) for (d, s) in search_results if s >= min_score]
-
-    # Return the matched titles and scores
-    return [{"title": d[index.embedding_field], "score": s} for d, s in filtered]
+    return [{"text": d['description'], "score": s} for d, s in filtered]
 
 ############################################################
 # DEMO
 ############################################################
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-    # Connect to MongoDB and insert demo data
     mongo_db = CustomMongoAggregator(
         uri="mongodb://localhost:27017/?directConnection=true",
         database="mydatabase",
-        collection="mycollection"
+        collection="products"
     )
     mongo_db.collection.delete_many({})
 
-    # Insert documents with distinct movie titles and ratings
     DATASET = [
-        {"_id": 1, "title": "A Journey Through Time", "rating": 5, "status": "active"},
-        {"_id": 2, "title": "Adventures in Space", "rating": 5, "status": "active"},
-        {"_id": 3, "title": "Midnight Mystery", "rating": 4, "status": "active"},
-        {"_id": 4, "title": "Time Traveler's Delight", "rating": 5, "status": "active"},
-        {"_id": 5, "title": "The Great Outdoors", "rating": 3, "status": "active"},
-        {"_id": 6, "title": "Exploring Mars", "rating": 5, "status": "active"},
-        {"_id": 7, "title": "Space Adventures Continued", "rating": 4, "status": "active"},
-        {"_id": 8, "title": "Back to the Future", "rating": 5, "status": "active"},
-        {"_id": 9, "title": "A Night at the Museum", "rating": 4, "status": "active"},
-        {"_id": 10,"title": "Journey into the Unknown", "rating": 5, "status": "active"}
+        {"_id": 1, "description": "High-quality wireless headset", "categories": ["Electronics", "Audio"], "rating": 5, "status": "active"},
+        {"_id": 2, "description": "Ergonomic office chair with lumbar support", "categories": ["Furniture", "Office"], "rating": 5, "status": "active"},
+        {"_id": 3, "description": "Durable stainless steel water bottle", "categories": ["Kitchen", "Outdoor"], "rating": 4, "status": "active"},
+        {"_id": 4, "description": "Bluetooth speaker with long battery life", "categories": ["Electronics", "Audio"], "rating": 5, "status": "active"},
+        {"_id": 5, "description": "Comfortable cotton t-shirt", "categories": ["Apparel"], "rating": 3, "status": "active"},
+        {"_id": 6, "description": "Noise-cancelling over-ear headphones", "categories": ["Electronics", "Audio"], "rating": 5, "status": "active"},
+        {"_id": 7, "description": "Adjustable standing desk converter", "categories": ["Furniture", "Office"], "rating": 4, "status": "active"},
+        {"_id": 8, "description": "Compact portable charger", "categories": ["Electronics", "Gadgets"], "rating": 5, "status": "active"},
+        {"_id": 9, "description": "Ceramic coffee mug", "categories": ["Kitchen"], "rating": 4, "status": "active"},
+        {"_id": 10,"description": "Lightweight running shoes", "categories": ["Apparel", "Outdoor"], "rating": 5, "status": "active"},
+        {"_id": 11, "description": "Insulated lunch box", "categories": ["Kitchen", "Outdoor"], "rating": 4, "status": "active"}
     ]
 
     mongo_db.collection.insert_many(DATASET)
 
-    # Build vector index on 'title' field
     all_docs = list(mongo_db.collection.find())
-    vs_index = VectorSearchIndex(all_docs, embedding_field='title')
+    vs_index = VectorSearchIndex(all_docs, embedding_fields=['description', 'categories'])
 
     def faiss_search_wrapper(doc, args):
         return faiss_search_operator(doc, args, vs_index)
 
-    # Add faiss search operator
     mongo_db.add_custom_operator('$faissSearch', faiss_search_wrapper)
 
-    # Aggregation pipeline:
-    # 1) Match docs with rating > 3 and active
-    # 2) Perform FAISS search for similar titles (top 5, min_score 0.8 for high relevance)
-    pipeline = [
+    pipeline1 = [
         {
             '$match': {
                 'rating': {'$gt': 3},
@@ -268,24 +272,57 @@ if __name__ == "__main__":
         },
         {
             '$project': {
-                'title': 1,
-                'similar_titles': {
-                    '$faissSearch': ['title', 5, 0.8]
+                'description': 1,
+                'similar_products': {
+                    '$faissSearch': ['description', 5, 0.8]
+                }
+            }
+        }
+    ]
+
+    pipeline2 = [
+        {
+            '$match': {
+                'rating': {'$gte': 4},
+                'status': 'active'
+            }
+        },
+        {
+            '$project': {
+                'description': 1,
+                'categories': 1,
+                'similar_category_products': {
+                    '$faissSearch': ['categories', 3, 0.7]
                 }
             }
         }
     ]
 
     try:
-        output = mongo_db.aggregate(pipeline)
+        output1 = mongo_db.aggregate(pipeline1)
     except Exception as e:
-        logging.error(f"Aggregation failed: {e}")
-        output = []
+        logger.error(f"Aggregation Pipeline 1 failed: {e}")
+        output1 = []
 
-    # Print results
-    for doc in output:
-        print(f"\nDocument ID {doc.get('_id')}:")
-        print(f"Title: {doc.get('title')}")
-        print("Similar Titles:")
-        for st in doc.get('similar_titles', []):
-            print(f" - {st['title']} (score: {st['score']:.2f})")
+    try:
+        output2 = mongo_db.aggregate(pipeline2)
+    except Exception as e:
+        logger.error(f"Aggregation Pipeline 2 failed: {e}")
+        output2 = []
+
+    print("\n--- Pipeline 1: Similar Products by Description ---")
+    for doc in output1:
+        print(f"\nID: {doc.get('_id')}")
+        print(f"Description: {doc.get('description')}")
+        print("Similar Products:")
+        for sp in doc.get('similar_products', []):
+            print(f" - {sp['text']} (score: {sp['score']:.2f})")
+
+    print("\n--- Pipeline 2: Similar Products by Category ---")
+    for doc in output2:
+        print(f"\nID: {doc.get('_id')}")
+        print(f"Description: {doc.get('description')}")
+        print(f"Categories: {', '.join(doc.get('categories', []))}")
+        print("Similar Products:")
+        for sp in doc.get('similar_category_products', []):
+            print(f" - {sp['text']} (score: {sp['score']:.2f})")
