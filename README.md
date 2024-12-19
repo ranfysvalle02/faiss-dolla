@@ -3,7 +3,7 @@ MongoDB with FAISS-powered vector search
 
 ---
 
-# **Enhancing MongoDB Aggregation Pipelines with a Custom FAISS operator**
+![](https://www.enkefalos.com/wp-content/uploads/2017/04/4.jpg)
 
 ---
 
