@@ -26,7 +26,7 @@ The MongoDB Aggregation Framework is a robust tool for processing and analyzing 
 - **Seamless Integration with ML Frameworks:**  
   FAISS effortlessly integrates with popular data representations such as NumPy arrays and PyTorch tensors, facilitating smooth workflows within machine learning pipelines.
 
-By marrying MongoDB’s scalable document storage with FAISS’s cutting-edge similarity search capabilities, developers can implement sophisticated semantic search functionalities directly on their existing datasets.
+By marrying MongoDB’s Aggregation Framework with FAISS’s cutting-edge similarity search capabilities, developers can implement sophisticated semantic search functionalities directly on their existing pipelines.
 
 ---
 
